@@ -15,6 +15,7 @@ common:
     - nrf54h20dk/nrf54h20/cpuapp
     - nrf54h20dk/nrf54h20/cpurad
     - nrf52_bsim
+    - nrf7120pdk/nrf7120/cpuapp
   integration_platforms:
     - nrf52840dk/nrf52840
   harness_config:
