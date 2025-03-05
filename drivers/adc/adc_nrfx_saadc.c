@@ -9,6 +9,7 @@
 #include <haly/nrfy_saadc.h>
 #include <zephyr/dt-bindings/adc/nrf-saadc-v3.h>
 #include <zephyr/dt-bindings/adc/nrf-saadc-nrf54l.h>
+#include <zephyr/dt-bindings/adc/nrf-saadc-nrf71.h>
 #include <zephyr/linker/devicetree_regions.h>
 
 #define LOG_LEVEL CONFIG_ADC_LOG_LEVEL
@@ -44,6 +45,21 @@ static const uint32_t saadc_psels[NRF_SAADC_DVDD + 1] = {
 	[NRF_SAADC_VDD]  = NRF_SAADC_INPUT_VDD,
 	[NRF_SAADC_AVDD] = NRF_SAADC_INPUT_AVDD,
 	[NRF_SAADC_DVDD] = NRF_SAADC_INPUT_DVDD,
+};
+#elif defined(CONFIG_SOC_NRF7120_ENGA)
+static const uint32_t saadc_psels[NRF_SAADC_VBAT + 1] = {
+	[NRF_SAADC_AIN0] = NRF_PIN_PORT_TO_PIN_NUMBER(0U, 1),
+	[NRF_SAADC_AIN1] = NRF_PIN_PORT_TO_PIN_NUMBER(1U, 1),
+	[NRF_SAADC_AIN2] = NRF_PIN_PORT_TO_PIN_NUMBER(2U, 1),
+	[NRF_SAADC_AIN3] = NRF_PIN_PORT_TO_PIN_NUMBER(3U, 1),
+	[NRF_SAADC_AIN4] = NRF_PIN_PORT_TO_PIN_NUMBER(5U, 1),
+	[NRF_SAADC_AIN5] = NRF_PIN_PORT_TO_PIN_NUMBER(6U, 1),
+	[NRF_SAADC_AIN6] = NRF_PIN_PORT_TO_PIN_NUMBER(7U, 1),
+	[NRF_SAADC_AIN7] = NRF_PIN_PORT_TO_PIN_NUMBER(8U, 1),
+	[NRF_SAADC_VDDAO1V8]  = NRF_SAADC_INPUT_VDDAO1V8,
+	[NRF_SAADC_VDDAO0V8] = NRF_SAADC_INPUT_VDDAO0V8,
+	[NRF_SAADC_VDDRF] = NRF_SAADC_INPUT_VDDRF,
+	[NRF_SAADC_VBAT] = NRF_SAADC_INPUT_VBAT,
 };
 #endif
 
