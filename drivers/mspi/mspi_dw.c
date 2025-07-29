@@ -136,6 +136,13 @@ static void tx_data(const struct device *dev,
 			buf_pos += 1;
 		}
 		write_dr(dev, data);
+		int count =0;
+		// while (read_sr(dev) & SR_BUSY_BIT) {
+		// }
+		while(count <1000)
+		{
+			count++;
+		}
 
 		if (buf_pos >= buf_end) {
 			/* Set the threshold to 0 to get the next interrupt
@@ -150,7 +157,6 @@ static void tx_data(const struct device *dev,
 			     - FIELD_GET(TXFLR_TXTFL_MASK, read_txflr(dev));
 		}
 	} while (room);
-
 	dev_data->buf_pos = (uint8_t *)buf_pos;
 }
 
@@ -220,7 +226,6 @@ static bool read_rx_fifo(const struct device *dev,
 				return true;
 			}
 		}
-
 		if (--in_fifo == 0) {
 			in_fifo = FIELD_GET(RXFLR_RXTFL_MASK, read_rxflr(dev));
 		}
@@ -244,10 +249,15 @@ static void mspi_dw_isr(const struct device *dev)
 	const struct mspi_xfer_packet *packet =
 		&dev_data->xfer.packets[dev_data->packets_done];
 	bool finished = false;
+	int rc = -1;
+
+	uint32_t int_status = read_isr(dev);
 
 	if (packet->dir == MSPI_TX) {
 		if (dev_data->buf_pos < dev_data->buf_end) {
-			tx_data(dev, packet);
+			if (int_status & ISR_TXEIS_BIT) {
+				tx_data(dev, packet);
+			}
 		} else {
 			/* It may happen that at this point the controller is
 			 * still shifting out the last frame (the last interrupt
@@ -260,7 +270,6 @@ static void mspi_dw_isr(const struct device *dev)
 			finished = true;
 		}
 	} else {
-		uint32_t int_status = read_isr(dev);
 
 		do {
 			if (int_status & ISR_RXFIS_BIT) {
@@ -292,16 +301,27 @@ static void mspi_dw_isr(const struct device *dev)
 
 		// For async, call the registered callback with event context
 		if (xfer.async && dev_data->cbs[MSPI_BUS_XFER_COMPLETE]) {
-			struct mspi_callback_context *cb_ctx = dev_data->cb_ctxs[MSPI_BUS_XFER_COMPLETE];
-			if (cb_ctx) {
-				cb_ctx->mspi_evt.evt_type = MSPI_BUS_XFER_COMPLETE;
-				cb_ctx->mspi_evt.evt_data.controller = dev;
-				cb_ctx->mspi_evt.evt_data.dev_id = dev_data->dev_id;
-				cb_ctx->mspi_evt.evt_data.packet = packet;
-				cb_ctx->mspi_evt.evt_data.status = 0; // Success, or set error if needed
-				cb_ctx->mspi_evt.evt_data.packet_idx = dev_data->packets_done;
+			if(dev_data->cb_ctxs[MSPI_BUS_XFER_COMPLETE]){
+				struct mspi_callback_context *cb_ctx = dev_data->cb_ctxs[MSPI_BUS_XFER_COMPLETE];
+				if (cb_ctx) {
+					cb_ctx->mspi_evt.evt_type = MSPI_BUS_XFER_COMPLETE;
+					cb_ctx->mspi_evt.evt_data.controller = dev;
+					cb_ctx->mspi_evt.evt_data.dev_id = dev_data->dev_id;
+					cb_ctx->mspi_evt.evt_data.packet = packet;
+					cb_ctx->mspi_evt.evt_data.status = 0; // Success, or set error if needed
+					cb_ctx->mspi_evt.evt_data.packet_idx = dev_data->packets_done;
+				}
+				dev_data->cbs[MSPI_BUS_XFER_COMPLETE](cb_ctx);
+				write_ssienr(dev, 0);
+				rc = pm_device_runtime_put(dev);
+				if (rc < 0) {
+					LOG_ERR("pm_device_runtime_put() failed: %d", rc);
+				}
 			}
-			dev_data->cbs[MSPI_BUS_XFER_COMPLETE](cb_ctx);
+			else{
+				LOG_WRN("User callback function not setup");
+			}
+			
 		}
 
 		k_sem_give(&dev_data->finished);
@@ -991,6 +1011,10 @@ static int start_next_packet(const struct device *dev, k_timeout_t timeout)
 		}
 	}
 
+	if (packet->dir == MSPI_TX && packet->num_bytes) {
+		tx_data(dev, packet);
+	}
+
 	/* Enable interrupts now and wait until the packet is done unless async. */
 	write_imr(dev, imr);
 
@@ -1001,7 +1025,7 @@ static int start_next_packet(const struct device *dev, k_timeout_t timeout)
 			LOG_ERR("RX FIFO overflow occurred");
 			rc = -EIO;
 		} else if (rc < 0) {
-			LOG_ERR("Transfer timed out");
+			LOG_ERR("Transfer timed out %d", rc);
 			rc = -ETIMEDOUT;
 		}
 	}
