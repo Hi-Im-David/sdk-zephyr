@@ -75,7 +75,6 @@ struct mspi_dw_data {
 	/* TODO: Change to atomic variable when concurrent transactions are supported*/
 	volatile bool async_in_progress;
 };
-#include "mspi_dw_vendor_specific.h"
 
 /* Register access helpers. */
 #define DEFINE_MM_REG_RD_WR(reg, off) \
@@ -109,6 +108,9 @@ DEFINE_MM_REG_WR(xip_write_incr_inst,	0x140)
 DEFINE_MM_REG_WR(xip_write_wrap_inst,	0x144)
 DEFINE_MM_REG_WR(xip_write_ctrl,	0x148)
 #endif
+
+#include "mspi_dw_vendor_specific.h"
+
 
 static int start_next_packet(const struct device *dev, k_timeout_t timeout);
 
@@ -262,17 +264,15 @@ static void mspi_dw_isr(const struct device *dev)
 		&dev_data->xfer.packets[dev_data->packets_done];
 	bool finished = false;
 	int rc;
-	bool dma_done = vendor_specific_read_dma_irq(dev, dev->config);
+	bool dma_irq = vendor_specific_read_dma_irq(dev, dev->config);
 	LOG_DBG("packet-dir = %d, dev_data->packets_done = %d", packet->dir, dev_data->packets_done);
 
 	uint32_t int_status = read_isr(dev);
 	LOG_DBG("isr status = 0x%8x", int_status);
 
-	if(xfer.xfer_mode == MSPI_DMA && dma_done) {
+	if(xfer.xfer_mode == MSPI_DMA && dma_irq) {
 		/* No need to read FIFO by CPU */
 		finished = true;
-		printk("DMA done\r\n");
-
 	}
 	else {
 
@@ -332,7 +332,6 @@ static void mspi_dw_isr(const struct device *dev)
 					cb_ctx->mspi_evt.evt_data.controller = dev;
 					cb_ctx->mspi_evt.evt_data.dev_id = dev_data->dev_id;
 					cb_ctx->mspi_evt.evt_data.packet = packet;
-					cb_ctx->mspi_evt.evt_data.status = 0; // Success, or set error if needed
 					cb_ctx->mspi_evt.evt_data.packet_idx = dev_data->packets_done;
 				}
 				LOG_DBG("Calling user set function");
@@ -353,6 +352,8 @@ static void mspi_dw_isr(const struct device *dev)
 				rc = start_next_packet(dev, K_MSEC(dev_data->xfer.timeout));
 				if (rc < 0) {
 					LOG_ERR("start_next_packet() failed: %d", rc);
+					dev_data->async_in_progress = false;
+					dev_data->packets_done = 0;
 				}
 			} else {
 				/* All packets completed - clear busy flag and reset packets done */
@@ -369,6 +370,7 @@ static void mspi_dw_isr(const struct device *dev)
 		/* Free transfer list saved to heap */
 		if (dev_data->xfer.xfer_mode == MSPI_DMA && dev_data->dma_transfer_list){
 			vendor_specific_free_dma_transfer_list(dev, dev_data);
+			dev_data->dma_transfer_list = NULL;
 		}
 
 		LOG_DBG("ISR finished");
@@ -851,7 +853,7 @@ static int start_next_packet_dma(const struct device *dev, k_timeout_t timeout)
 	unsigned int key;
 	uint32_t packet_frames;
 	uint32_t imr;
-	int rc = 0;
+	int rc;
 
 	uint8_t *dma_buffer = packet->data_buf;
 	uint32_t total_transfer_len = packet->num_bytes + xfer.addr_length + xfer.cmd_length;
@@ -934,7 +936,12 @@ static int start_next_packet_dma(const struct device *dev, k_timeout_t timeout)
 	write_dmatdlr(dev, FIELD_PREP(DMA_TDLR_DMATDL_MASK, dev_config->dma_tx_data_level));
 	write_dmardlr(dev, FIELD_PREP(DMA_RDLR_DMARDL_MASK, dev_config->dma_rx_data_level));
 	write_dmacr(dev, dev_data->dma_cr);
-	vendor_specific_setup_dma_xfer(dev, dev_config, packet, &xfer, dev_data);
+	rc = vendor_specific_setup_dma_xfer(dev, dev_config, packet, &xfer, dev_data);
+
+	if(rc < 0) {
+		LOG_ERR("Vendor specific DMA xfer failure %d", rc);
+		return rc;
+	}
 
 	if (xip_enabled) {
 		write_ssienr(dev, SSIENR_SSIC_EN_BIT);
@@ -942,6 +949,8 @@ static int start_next_packet_dma(const struct device *dev, k_timeout_t timeout)
 	}
 	write_ssienr(dev, SSIENR_SSIC_EN_BIT);
 	vendor_specific_start_dma_xfer(dev, dev_config);
+
+	
 
 	/* Wait for completion if synchronous */
 	if (!xfer.async) {
