@@ -72,7 +72,8 @@ struct mspi_dw_data {
 	struct mspi_xfer xfer;
 	void * dma_transfer_list;
 	/* Flag to track if async transfer is in progress */
-	bool async_in_progress;
+	/* TODO: Change to atomic variable when concurrent transactions are supported*/
+	volatile bool async_in_progress;
 };
 #include "mspi_dw_vendor_specific.h"
 
@@ -109,8 +110,7 @@ DEFINE_MM_REG_WR(xip_write_wrap_inst,	0x144)
 DEFINE_MM_REG_WR(xip_write_ctrl,	0x148)
 #endif
 
-static int start_next_packet_pio(const struct device *dev, k_timeout_t timeout);
-static int start_next_packet_dma(const struct device *dev, k_timeout_t timeout);
+static int start_next_packet(const struct device *dev, k_timeout_t timeout);
 
 static void tx_data(const struct device *dev,
 		    const struct mspi_xfer_packet *packet)
@@ -151,6 +151,7 @@ static void tx_data(const struct device *dev,
 		{
 			count++;
 		}
+		// k_msleep(1);
 
 		if (buf_pos >= buf_end) {
 			/* Set the threshold to 0 to get the next interrupt
@@ -165,6 +166,7 @@ static void tx_data(const struct device *dev,
 			     - FIELD_GET(TXFLR_TXTFL_MASK, read_txflr(dev));
 		}
 	} while (room);
+
 	dev_data->buf_pos = (uint8_t *)buf_pos;
 }
 
@@ -234,6 +236,7 @@ static bool read_rx_fifo(const struct device *dev,
 				return true;
 			}
 		}
+
 		if (--in_fifo == 0) {
 			in_fifo = FIELD_GET(RXFLR_RXTFL_MASK, read_rxflr(dev));
 		}
@@ -252,19 +255,24 @@ static bool read_rx_fifo(const struct device *dev,
 
 static void mspi_dw_isr(const struct device *dev)
 {
+	LOG_DBG("isr triggered");
 	struct mspi_dw_data *dev_data = dev->data;
 	struct mspi_xfer xfer = dev_data->xfer;
 	const struct mspi_xfer_packet *packet =
 		&dev_data->xfer.packets[dev_data->packets_done];
 	bool finished = false;
-	int rc = -1;
+	int rc;
 	bool dma_done = vendor_specific_read_dma_irq(dev, dev->config);
+	LOG_DBG("packet-dir = %d, dev_data->packets_done = %d", packet->dir, dev_data->packets_done);
 
 	uint32_t int_status = read_isr(dev);
+	LOG_DBG("isr status = 0x%8x", int_status);
 
 	if(xfer.xfer_mode == MSPI_DMA && dma_done) {
-		/* No need to read FIFO manually */
+		/* No need to read FIFO by CPU */
 		finished = true;
+		printk("DMA done\r\n");
+
 	}
 	else {
 
@@ -312,10 +320,7 @@ static void mspi_dw_isr(const struct device *dev)
 	}
 
 	if (finished) {
-		/* Free transfer list saved to heap */
-		vendor_specific_free_dma_transfer_list(dev, dev_data);
 		write_imr(dev, 0);
-
 		// For async, call the registered callback with event context
 		if (xfer.async){
 			write_ssienr(dev, 0);
@@ -330,6 +335,7 @@ static void mspi_dw_isr(const struct device *dev)
 					cb_ctx->mspi_evt.evt_data.status = 0; // Success, or set error if needed
 					cb_ctx->mspi_evt.evt_data.packet_idx = dev_data->packets_done;
 				}
+				LOG_DBG("Calling user set function");
 				dev_data->cbs[MSPI_BUS_XFER_COMPLETE](cb_ctx);
 				rc = pm_device_runtime_put(dev);
 				if (rc < 0) {
@@ -337,14 +343,16 @@ static void mspi_dw_isr(const struct device *dev)
 				}
 			}
 			k_sem_give(&dev_data->finished);
-
-			/* In async mode, the next packet is started from the isr*/
+			LOG_DBG("dev_data->packets_done = %d", dev_data->packets_done+1);
+			LOG_DBG("xfer.num_packets = %d", xfer.num_packet);
+			/* In async mode, the next packet is started from the isr */
+			/* TODO: I think this be setup in work queue instead? */
 			if(++dev_data->packets_done != xfer.num_packet) {
+				LOG_DBG("Another packet to be sent");
 				vendor_specific_irq_clear(dev, dev->config);
-				if (dev_data->xfer.xfer_mode == MSPI_DMA) {
-					start_next_packet_dma(dev, K_MSEC(dev_data->xfer.timeout));
-				} else if (dev_data->xfer.xfer_mode == MSPI_PIO){
-					start_next_packet_pio(dev, K_MSEC(dev_data->xfer.timeout));
+				rc = start_next_packet(dev, K_MSEC(dev_data->xfer.timeout));
+				if (rc < 0) {
+					LOG_ERR("start_next_packet() failed: %d", rc);
 				}
 			} else {
 				/* All packets completed - clear busy flag and reset packets done */
@@ -356,6 +364,14 @@ static void mspi_dw_isr(const struct device *dev)
 			/* Only give semaphore for sync mode or when all packets are done in async mode */
 			k_sem_give(&dev_data->finished);
 		}
+
+
+		/* Free transfer list saved to heap */
+		if (dev_data->xfer.xfer_mode == MSPI_DMA && dev_data->dma_transfer_list){
+			vendor_specific_free_dma_transfer_list(dev, dev_data);
+		}
+
+		LOG_DBG("ISR finished");
 	}
 
 	vendor_specific_irq_clear(dev, dev->config);
@@ -821,11 +837,9 @@ static void tx_control_field(const struct device *dev,
 	} while (shift);
 }
 
-/**
- * @brief Start next packet using DMA mode
- */
 static int start_next_packet_dma(const struct device *dev, k_timeout_t timeout)
 {
+	LOG_DBG("DMA mode");
 	const struct mspi_dw_config *dev_config = dev->config;
 	struct mspi_dw_data *dev_data = dev->data;
 	struct mspi_xfer xfer = dev_data->xfer;
@@ -840,7 +854,7 @@ static int start_next_packet_dma(const struct device *dev, k_timeout_t timeout)
 	int rc = 0;
 
 	uint8_t *dma_buffer = packet->data_buf;
-	uint32_t total_transfer_len = packet->num_bytes;
+	uint32_t total_transfer_len = packet->num_bytes + xfer.addr_length + xfer.cmd_length;
 
 	if (packet->num_bytes == 0 &&
 	    dev_data->xfer.cmd_length == 0 &&
@@ -906,6 +920,7 @@ static int start_next_packet_dma(const struct device *dev, k_timeout_t timeout)
 		write_ssienr(dev, 0);
 	}
 
+	LOG_DBG("packet_frames = %d", packet_frames);
 	write_ctrlr0(dev, dev_data->ctrlr0);
 	write_ctrlr1(dev, packet_frames > 0
 		? FIELD_PREP(CTRLR1_NDF_MASK, packet_frames - 1)
@@ -946,6 +961,8 @@ static int start_next_packet_dma(const struct device *dev, k_timeout_t timeout)
 		}
 	}
 
+	LOG_DBG("Ended dma packet");
+
 	return rc;
 }
 
@@ -966,6 +983,8 @@ static int start_next_packet_pio(const struct device *dev, k_timeout_t timeout)
 	uint32_t packet_frames;
 	uint32_t imr;
 	int rc = 0;
+
+	uint32_t in_fifo = FIELD_GET(RXFLR_RXTFL_MASK, read_rxflr(dev));
 
 	if (packet->num_bytes == 0 &&
 	    dev_data->xfer.cmd_length == 0 &&
@@ -1180,7 +1199,9 @@ static int start_next_packet_pio(const struct device *dev, k_timeout_t timeout)
 
 	/* Enable interrupts now and wait until the packet is done unless async. */
 	write_imr(dev, imr);
+
 	if (!xfer.async) {
+		LOG_DBG("waiting for isr to finish");
 		rc = k_sem_take(&dev_data->finished, timeout);
 		/* TODO: detect overflow in async mode*/
 		if (read_risr(dev) & RISR_RXOIR_BIT) {
@@ -1202,8 +1223,10 @@ static int start_next_packet_pio(const struct device *dev, k_timeout_t timeout)
 		 */
 		if (rc == -ETIMEDOUT) {
 			key = irq_lock();
+
 			write_ssienr(dev, 0);
 			write_ssienr(dev, SSIENR_SSIC_EN_BIT);
+
 			irq_unlock(key);
 		}
 	} else {
@@ -1224,6 +1247,20 @@ static int start_next_packet_pio(const struct device *dev, k_timeout_t timeout)
 	}
 
 	return rc;
+}
+
+static int start_next_packet(const struct device *dev, k_timeout_t timeout)
+{
+	struct mspi_dw_data * dev_data = dev->data;
+    switch (dev_data->xfer.xfer_mode) {
+    case MSPI_DMA:
+        return start_next_packet_dma(dev, timeout);
+    case MSPI_PIO:
+        return start_next_packet_pio(dev, timeout);
+    default:
+        LOG_ERR("Xfer mode not supported");
+        return -EIO;
+    }
 }
 
 static int _api_transceive(const struct device *dev,
@@ -1261,27 +1298,13 @@ static int _api_transceive(const struct device *dev,
 	 * For async, next packet is started by ISR, also choose between DMA and PIO 
 	 * mode based on transfer configuration 
 	 */
-	if(req->async) {
-		if (dev_data->xfer.xfer_mode == MSPI_DMA) {
-			rc = start_next_packet_dma(dev, K_MSEC(dev_data->xfer.timeout));
-		} else if (dev_data->xfer.xfer_mode == MSPI_PIO){
-			rc = start_next_packet_pio(dev, K_MSEC(dev_data->xfer.timeout));
-		}
-	}
-	else {
+	if (req->async) {
+    rc = start_next_packet(dev, K_MSEC(dev_data->xfer.timeout));
+	} else {
 		for (dev_data->packets_done = 0;
-		dev_data->packets_done < dev_data->xfer.num_packet;
-		dev_data->packets_done++) {
-			if (dev_data->xfer.xfer_mode == MSPI_DMA) {
-				rc = start_next_packet_dma(dev, K_MSEC(dev_data->xfer.timeout));
-			} else if (dev_data->xfer.xfer_mode == MSPI_PIO){
-				rc = start_next_packet_pio(dev, K_MSEC(dev_data->xfer.timeout));
-			}
-			else {
-				LOG_ERR("Xfer mode not supported");
-				return -EIO;
-			}
-
+	     dev_data->packets_done < dev_data->xfer.num_packet;
+	     dev_data->packets_done++) {
+			rc = start_next_packet(dev, K_MSEC(dev_data->xfer.timeout));
 			if (rc < 0) {
 				return rc;
 			}
@@ -1290,6 +1313,8 @@ static int _api_transceive(const struct device *dev,
 
 	return 0;
 }
+
+
 
 static int api_transceive(const struct device *dev,
 			  const struct mspi_dev_id *dev_id,
@@ -1308,6 +1333,7 @@ static int api_transceive(const struct device *dev,
 	}
 
 	if (req->async) {
+		LOG_DBG("async transfer selected");
 		cb = dev_data->cbs[MSPI_BUS_XFER_COMPLETE];
 		cb_ctx = dev_data->cb_ctxs[MSPI_BUS_XFER_COMPLETE];
 	}
