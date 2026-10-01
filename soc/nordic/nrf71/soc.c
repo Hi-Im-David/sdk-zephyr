@@ -48,11 +48,7 @@ LOG_MODULE_REGISTER(soc, CONFIG_SOC_LOG_LEVEL);
 /* TF-M configures LFXO as non-secure (see spu_periph_init_cfg() in target_cfg_71.c), so when this
  * file is built as part of TF-M, LFXO must be accessed through its non-secure address.
  */
-#ifdef __ZEPHYR__
 #define LFXO_REG NRF_LFXO
-#else
-#define LFXO_REG NRF_LFXO_NS
-#endif
 
 #if !defined(CONFIG_TRUSTED_EXECUTION_NONSECURE)
 
